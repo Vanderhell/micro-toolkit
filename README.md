@@ -19,11 +19,6 @@ from nested `switch` statements, retry logic scattered across files, config
 stored as raw bytes with no validation, `printf` debugging that never gets
 removed, and ring buffers written from scratch for every UART.
 
-These are solved problems — but in embedded C, there's no ecosystem of
-small, composable, zero-dependency libraries like there is in Rust or Go.
-You either pull in a massive framework (Zephyr, ESP-IDF) or write
-everything yourself.
-
 **micro-toolkit** is a collection of focused C99 libraries that solve
 one problem each, compose cleanly, and share a common philosophy:
 
@@ -48,11 +43,14 @@ one problem each, compose cleanly, and share a common philosophy:
 │           │ limiter   │           │          │              │
 ├───────────┴───────────┴───────────┴──────────┴──────────────┤
 │  iotspool ── persistent MQTT queue                          │
-│  MCU-Malloc-Tracker ── heap diagnostics                     │
+│  nvlog ── power-loss safe append log                        │
+├─────────────────────────────────────────────────────────────┤
+│  Safety: defer · cguard · safemath · panicdump              │
+│  Diagnostics: MCU-Malloc-Tracker                            │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-## Libraries
+## Core libraries
 
 | Library | Description | Lines | Tests | Links |
 |---------|-------------|-------|-------|-------|
@@ -63,28 +61,49 @@ one problem each, compose cleanly, and share a common philosophy:
 | [**microsh**](https://github.com/Vanderhell/microsh) | Debug shell with history + tab completion | 680 | 43 | [README](https://github.com/Vanderhell/microsh#readme) |
 | [**microcbor**](https://github.com/Vanderhell/microcbor) | Minimal CBOR encoder/decoder (RFC 8949) | 750 | 43 | [README](https://github.com/Vanderhell/microcbor#readme) |
 | [**micoring**](https://github.com/Vanderhell/micoring) | Generic ISR-safe ring buffer (SPSC) | 423 | 33 | [README](https://github.com/Vanderhell/micoring#readme) |
-| [**iotspool**](https://github.com/Vanderhell/iotspool) | Persistent store-and-forward MQTT queue | — | — | [README](https://github.com/Vanderhell/iotspool#readme) |
-| [**MCU-Malloc-Tracker**](https://github.com/Vanderhell/MCU-Malloc-Tracker) | Deterministic heap diagnostics | — | — | [README](https://github.com/Vanderhell/MCU-Malloc-Tracker#readme) |
 
-**Total: 4,391 lines of engine code · 269 tests · 9 libraries**
+**Total: 4,391 lines of engine code · 269 tests**
+
+## Companion libraries
+
+These are standalone projects from the same ecosystem — same philosophy, same quality.
+
+### Data persistence
+
+| Library | Description |
+|---------|-------------|
+| [**iotspool**](https://github.com/Vanderhell/iotspool) | Persistent store-and-forward MQTT queue. Survives power loss and reboots. C99, zero deps. |
+| [**nvlog**](https://github.com/Vanderhell/nvlog) | Power-loss safe append log for FRAM/EEPROM/NOR flash. No heap, no filesystem. 186 tests. |
+
+### Safety & correctness
+
+| Library | Description |
+|---------|-------------|
+| [**defer**](https://github.com/Vanderhell/defer) | Automatic resource cleanup via `DEFER()` macro. Single header, GCC/Clang/ARM. |
+| [**cguard**](https://github.com/Vanderhell/cguard) | Scope guards and result types for C. Auto cleanup (free, fclose, unlock). Header-only. |
+| [**safemath**](https://github.com/Vanderhell/safemath) | Overflow-checked add, mul, align and buffer sizing. Single header, C99. |
+
+### Diagnostics
+
+| Library | Description |
+|---------|-------------|
+| [**panicdump**](https://github.com/Vanderhell/panicdump) | Cortex-M3/M4 crash dump — capture on fault, survive reboot, decode offline. |
+| [**MCU-Malloc-Tracker**](https://github.com/Vanderhell/MCU-Malloc-Tracker) | Deterministic heap diagnostics — malloc/free tracking, binary snapshots, CRC validation. |
 
 ## Design philosophy
 
 Every library in the toolkit follows the same rules:
 
 1. **C99** — no extensions, no C11+. Compiles with gcc, clang, armcc, iccarm.
-2. **Zero dependencies** — each library depends only on the C standard library (`stdint.h`, `string.h`, etc.).
+2. **Zero dependencies** — each library depends only on the C standard library.
 3. **Zero dynamic allocation** — no `malloc`, ever. All state is caller-provided.
 4. **ROM-friendly** — definitions and policies are `const` and can live in flash.
-5. **Portable** — no platform-specific code. Platform integration via callbacks (clock, I/O, output).
+5. **Portable** — no platform-specific code. Platform integration via callbacks.
 6. **Two files** — one `.h`, one `.c`. Drop into any build system.
-7. **Tested** — every library has a comprehensive test suite that passes with `-Wall -Wextra -Wpedantic -Werror`.
-8. **Documented** — README, API reference, design rationale, and porting guide for each library.
+7. **Tested** — comprehensive test suites, all pass with `-Wall -Wextra -Wpedantic -Werror`.
+8. **Documented** — README, API reference, design rationale, and porting guide.
 
 ## How they work together
-
-The libraries are independent — you can use any one without the others.
-But they're designed to compose:
 
 ```
                  ┌──────────┐
@@ -125,9 +144,6 @@ Log level set to DEBUG
 
 > breaker status
 Breaker: CLOSED (0 failures)
-
-> ring count uart_rx
-uart_rx: 12/64 elements
 ```
 
 ## Quick start
@@ -144,6 +160,10 @@ uart_rx: 12/64 elements
 | Send compact sensor data over MQTT | microcbor |
 | Buffer UART bytes or events from ISR | micoring |
 | Queue MQTT messages through power loss | iotspool |
+| Append log entries to flash (power-safe) | nvlog |
+| Auto-cleanup resources (free, fclose) | defer / cguard |
+| Overflow-checked buffer math | safemath |
+| Capture crash dumps on Cortex-M | panicdump |
 | Track heap usage on bare metal | MCU-Malloc-Tracker |
 
 ### Add to your project
@@ -154,39 +174,15 @@ Each library is two files. Copy them, or use git submodules:
 git submodule add https://github.com/Vanderhell/microfsm.git  lib/microfsm
 git submodule add https://github.com/Vanderhell/microres.git   lib/microres
 git submodule add https://github.com/Vanderhell/microconf.git  lib/microconf
-git submodule add https://github.com/Vanderhell/microlog.git   lib/microlog
-git submodule add https://github.com/Vanderhell/microsh.git    lib/microsh
-git submodule add https://github.com/Vanderhell/microcbor.git  lib/microcbor
-git submodule add https://github.com/Vanderhell/micoring.git   lib/micoring
-```
-
-### CMake
-
-```cmake
-# Add each library you need
-add_subdirectory(lib/microfsm)
-add_subdirectory(lib/microlog)
-# ...
-target_link_libraries(my_firmware PRIVATE microfsm microlog ...)
+# ... add what you need
 ```
 
 ## Example: IoT sensor node
 
-A complete example showing all libraries working together is in
+A complete example showing all 7 core libraries working together is in
 [`examples/iot-sensor-node/`](examples/iot-sensor-node/).
 
-This simulates a temperature sensor that:
-- Boots → connects → reads sensors → publishes via MQTT
-- Handles disconnections with circuit breaker + retry
-- Stores config in flash with CRC validation
-- Logs everything with structured logging
-- Encodes telemetry in CBOR
-- Buffers events from ISR via ring buffer
-- Provides a debug shell over UART
-
 ## Supported platforms
-
-All libraries are tested on:
 
 | Platform | Compiler | Notes |
 |----------|----------|-------|
@@ -198,26 +194,12 @@ All libraries are tested on:
 | Windows | MSVC (C11 mode) | Testing and simulation |
 | macOS | clang | Development |
 
-## Repository checklist
-
-- [x] Clear value proposition and architecture overview
-- [x] Quick-start and integration snippets
-- [x] Example project in `examples/iot-sensor-node/`
-- [x] MIT license
-- [x] Maintainer attribution (Vanderhell)
-- [x] GitHub-ready badges
-- [ ] CI workflow badge (add after first GitHub Actions workflow is created)
-
-## Topics for GitHub
-
-`c`, `c99`, `embedded`, `iot`, `firmware`, `mcu`, `bare-metal`, `mqtt`, `modbus`, `state-machine`, `ring-buffer`, `cbor`, `logging`, `no-heap`, `zero-dependencies`
 ## License
 
-All libraries are MIT licensed. Use them however you want.
+All libraries are MIT licensed.
 
 ## Author
 
 Built by [Vanderhell](https://github.com/Vanderhell) — embedded systems
 developer focused on industrial IoT, Modbus, and MQTT.
-
 
