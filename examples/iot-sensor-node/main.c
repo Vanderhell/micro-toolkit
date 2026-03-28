@@ -1,597 +1,745 @@
 /*
- * IoT Sensor Node — Example using the complete micro-toolkit.
+ * iot-sensor-node — Kompletný ESP32 príklad so VŠETKÝMI 9 micro-toolkit knižnicami.
  *
- * This example simulates a temperature/humidity sensor node that:
+ * Toto je SKUTOČNÝ príklad — používa reálne API z tvojich GitHub repozitárov:
  *
- *   1. Boots and loads config from flash (microconf)
- *   2. Manages device lifecycle with a state machine (microfsm)
- *   3. Buffers sensor events from ISR via ring buffer (micoring)
- *   4. Retries MQTT connections with exponential backoff (microres)
- *   5. Encodes telemetry in compact CBOR format (microcbor)
- *   6. Logs everything with structured logging (microlog)
- *   7. Provides a debug shell for runtime inspection (microsh)
+ *   microconf   → struct-based config s MCONF_ENTRY makrami + CRC flash storage
+ *   microfsm    → mfsm_def_t + mfsm_t, table-driven FSM s guard/action callbackmi
+ *   micoring    → ISR-safe SPSC ring buffer pre DHT22 senzorové eventy
+ *   microres    → mres_breaker_call(op_fn) + mres_breaker_report_* + retry policy
+ *   microcbor   → mcbor_enc_str/float/uint + mcbor_enc_size + mcbor_enc_overflow
+ *   microlog    → mlog_t + mlog_add_backend + MLOG_INFO/DEBUG makrá (global logger)
+ *   microsh     → msh_init + msh_register (per-command), msh_cmd_fn(argc, argv, ctx)
+ *   microtimer  → mtimer_create + mtimer_start, callback(timer_id, ctx)
+ *   microbus    → mbus_signal/queue_signal/publish(payload), mbus_dispatch
  *
- * This is a simulation that runs on Linux/macOS for demonstration.
- * On real hardware, replace the platform stubs with actual HAL calls.
+ * Build (Linux):  make -f Makefile.sim && ./sensor_node
+ * Build (ESP32):  idf.py build && idf.py flash monitor
  *
- * Build:
- *   gcc -std=c99 -Wall -Wextra \
- *       -I../../microfsm/include -I../../microres/include \
- *       -I../../microconf/include -I../../microlog/include \
- *       -I../../microsh/include -I../../microcbor/include \
- *       -I../../micoring/include \
- *       ../../microfsm/src/mfsm.c ../../microres/src/mres.c \
- *       ../../microconf/src/mconf.c ../../microlog/src/mlog.c \
- *       ../../microsh/src/msh.c ../../microcbor/src/mcbor.c \
- *       ../../micoring/src/mring.c \
- *       main.c -o sensor_node
- *
- * Run:
- *   ./sensor_node
+ * SPDX-License-Identifier: MIT
+ * https://github.com/Vanderhell/micro-toolkit
  */
 
-#define _POSIX_C_SOURCE 199309L
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Platform detection
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifdef ESP_PLATFORM
+  #include "freertos/FreeRTOS.h"
+  #include "freertos/task.h"
+  #include "esp_timer.h"
+  #include "nvs_flash.h"
+  #define PLATFORM_ESP32
+#else
+  #define _POSIX_C_SOURCE 200809L
+  #include <time.h>
+  #include <unistd.h>
+  #define PLATFORM_LINUX
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <time.h>
-#include <unistd.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stddef.h>
 
-/* ── Include the entire toolkit ────────────────────────────────────────── */
-
-#include "mfsm.h"    /* State machine */
-#include "mres.h"    /* Resilience (retry, circuit breaker) */
-#include "mconf.h"   /* Configuration */
-#include "mlog.h"    /* Logging */
-#include "msh.h"     /* Debug shell */
-#include "mcbor.h"   /* CBOR serialization */
-#include "mring.h"   /* Ring buffer */
+/* ── Všetkých 9 knižníc ─────────────────────────────────────────────────── */
+#include "mfsm.h"
+#include "mres.h"
+#include "mconf.h"
+#include "mlog.h"
+#include "msh.h"
+#include "mcbor.h"
+#include "mring.h"
+#include "mtimer.h"
+#include "mbus.h"
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Platform stubs (replace with HAL on real hardware)
+ * Platform abstraction
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static uint32_t platform_clock(void)
+static uint32_t plat_now_ms(void)
 {
+#ifdef PLATFORM_ESP32
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
+#endif
 }
 
-static void platform_sleep(uint32_t ms)
+static void plat_sleep_ms(uint32_t ms)
 {
-    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (ms % 1000) * 1000000 };
+#ifdef PLATFORM_ESP32
+    vTaskDelay(pdMS_TO_TICKS(ms));
+#else
+    struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L };
     nanosleep(&ts, NULL);
-}
-
-/* Simulated flash storage */
-static uint8_t fake_flash[512];
-
-static int flash_read(uint32_t offset, void *buf, uint32_t len)
-{
-    memcpy(buf, fake_flash + offset, len);
-    return 0;
-}
-
-static int flash_write(uint32_t offset, const void *buf, uint32_t len)
-{
-    memcpy(fake_flash + offset, buf, len);
-    return 0;
-}
-
-static const mconf_io_t flash_io = {
-    .read = flash_read, .write = flash_write, .erase = NULL
-};
-
-/* Shell output */
-static void shell_print(const char *str, void *ctx)
-{
-    (void)ctx;
-    fputs(str, stdout);
-    fflush(stdout);
-}
-
-/* Log output */
-static void log_write(const char *buf, uint16_t len, mlog_level_t level,
-                       void *ctx)
-{
-    (void)len; (void)level; (void)ctx;
-    fputs(buf, stderr);
+#endif
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Configuration (microconf)
+ * microlog — backend setup
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void shell_print(const char *str, void *ctx) { (void)ctx; fputs(str, stdout); }
+
+static void stdout_write(const char *buf, uint16_t len, mlog_level_t level, void *ctx)
+{
+    (void)len; (void)level; (void)ctx;
+    fputs(buf, stdout);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * microconf — config struct + schema
+ *
+ * Real API: MCONF_ENTRY macro maps struct fields by offset.
+ * Access: mconf_find(schema, "key") → index, then mconf_get_u32(s, d, idx, &out)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
 typedef struct {
-    char     mqtt_host[48];
-    uint16_t mqtt_port;
-    bool     mqtt_tls;
-    char     device_id[24];
-    uint32_t report_interval_ms;
-    float    temp_offset;
-    uint8_t  log_level;
-} app_config_t;
+    char     mqtt_host[32];
+    uint32_t mqtt_port;
+    char     device_id[32];
+    uint32_t report_ms;
+    int32_t  temp_offset;
+} node_config_t;
 
-static const char     DEF_HOST[]     = "broker.local";
-static const uint16_t DEF_PORT       = 1883;
-static const bool     DEF_TLS        = false;
-static const char     DEF_DEVICE[]   = "sensor-01";
-static const uint32_t DEF_INTERVAL   = 5000;
-static const float    DEF_OFFSET     = 0.0f;
-static const uint8_t  DEF_LOG        = 2;
+/* Default values — pointers required by MCONF_ENTRY */
+static const char     CFG_DEF_MQTT_HOST[]  = "broker.local";
+static const char     CFG_DEF_DEVICE_ID[]  = "esp32-node-01";
+static const uint32_t CFG_DEF_MQTT_PORT    = 1883;
+static const uint32_t CFG_DEF_REPORT_MS    = 5000;
+static const int32_t  CFG_DEF_TEMP_OFFSET  = 0;
 
-enum {
-    CFG_HOST, CFG_PORT, CFG_TLS, CFG_DEVICE, CFG_INTERVAL,
-    CFG_OFFSET, CFG_LOG, CFG_COUNT
+static const mconf_entry_t g_entries[] = {
+    MCONF_ENTRY(node_config_t, mqtt_host,   MCONF_TYPE_STR, CFG_DEF_MQTT_HOST),
+    MCONF_ENTRY(node_config_t, mqtt_port,   MCONF_TYPE_U32, &CFG_DEF_MQTT_PORT),
+    MCONF_ENTRY(node_config_t, device_id,   MCONF_TYPE_STR, CFG_DEF_DEVICE_ID),
+    MCONF_ENTRY(node_config_t, report_ms,   MCONF_TYPE_U32, &CFG_DEF_REPORT_MS),
+    MCONF_ENTRY(node_config_t, temp_offset, MCONF_TYPE_I32, &CFG_DEF_TEMP_OFFSET),
 };
 
-static const mconf_entry_t config_entries[] = {
-    MCONF_ENTRY(app_config_t, mqtt_host,          MCONF_TYPE_STR,   DEF_HOST),
-    MCONF_ENTRY(app_config_t, mqtt_port,          MCONF_TYPE_U16,   &DEF_PORT),
-    MCONF_ENTRY(app_config_t, mqtt_tls,           MCONF_TYPE_BOOL,  &DEF_TLS),
-    MCONF_ENTRY(app_config_t, device_id,          MCONF_TYPE_STR,   DEF_DEVICE),
-    MCONF_ENTRY(app_config_t, report_interval_ms, MCONF_TYPE_U32,   &DEF_INTERVAL),
-    MCONF_ENTRY(app_config_t, temp_offset,        MCONF_TYPE_FLOAT, &DEF_OFFSET),
-    MCONF_ENTRY(app_config_t, log_level,          MCONF_TYPE_U8,    &DEF_LOG),
-};
-
-static const mconf_schema_t config_schema = {
-    .entries     = config_entries,
-    .num_entries = CFG_COUNT,
+static const mconf_schema_t g_schema = {
+    .entries     = g_entries,
+    .num_entries = 5,
     .version     = 1,
-    .data_size   = sizeof(app_config_t),
+    .data_size   = sizeof(node_config_t),
+};
+
+/* Simulated flash storage */
+static uint8_t g_flash[512];
+
+static int flash_read (uint32_t off, void *buf, uint32_t len) { memcpy(buf, g_flash+off, len); return 0; }
+static int flash_write(uint32_t off, const void *buf, uint32_t len) { memcpy(g_flash+off, buf, len); return 0; }
+static int flash_erase(uint32_t off, uint32_t len) { memset(g_flash+off, 0xFF, len); return 0; }
+
+static const mconf_io_t g_flash_io = {
+    .read  = flash_read,
+    .write = flash_write,
+    .erase = flash_erase,
 };
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * State machine (microfsm)
+ * microfsm — state machine
+ *
+ * Real API: mfsm_def_t (const, ROM) + mfsm_t (instance, RAM)
+ * Callbacks: mfsm_action_fn(void *user_data) — no mfsm_t* param!
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-enum {
-    ST_INIT, ST_CONNECTING, ST_ONLINE, ST_PUBLISHING,
-    ST_BACKOFF, ST_ERROR, ST_COUNT
+typedef enum { ST_BOOT, ST_CONNECTING, ST_ONLINE, ST_PUBLISHING, ST_ERROR, ST_COUNT } app_state_t;
+typedef enum { EV_BOOT_DONE, EV_WIFI_UP, EV_MQTT_UP, EV_PUB_OK, EV_PUB_FAIL, EV_BREAKER_OPEN, EV_RECOVER } app_event_t;
+
+/* Forward declare app_t for callbacks */
+typedef struct app_s app_t;
+
+static void on_enter_boot      (void *u) { (void)u; MLOG_INFO("FSM","%s","→ BOOT");       }
+static void on_enter_connecting(void *u) { (void)u; MLOG_INFO("FSM","%s","→ CONNECTING"); }
+static void on_enter_online    (void *u) { (void)u; MLOG_INFO("FSM","%s","→ ONLINE");     }
+static void on_enter_publishing(void *u) { (void)u; MLOG_DEBUG("FSM","%s","→ PUBLISHING"); }
+static void on_enter_error     (void *u) { (void)u; MLOG_ERROR("FSM","%s","→ ERROR: circuit breaker OPEN"); }
+
+static const mfsm_state_t g_states[ST_COUNT] = {
+    [ST_BOOT]       = { .on_enter = on_enter_boot,       .name = "BOOT"       },
+    [ST_CONNECTING] = { .on_enter = on_enter_connecting, .name = "CONNECTING" },
+    [ST_ONLINE]     = { .on_enter = on_enter_online,     .name = "ONLINE"     },
+    [ST_PUBLISHING] = { .on_enter = on_enter_publishing, .name = "PUBLISHING" },
+    [ST_ERROR]      = { .on_enter = on_enter_error,      .name = "ERROR"      },
 };
 
-enum {
-    EV_BOOT_DONE, EV_CONNECTED, EV_PUBLISH, EV_PUB_ACK,
-    EV_DISCONNECT, EV_RETRY, EV_FATAL
+static const mfsm_transition_t g_transitions[] = {
+    { ST_BOOT,       EV_BOOT_DONE,    ST_CONNECTING, NULL, NULL },
+    { ST_CONNECTING, EV_WIFI_UP,      ST_CONNECTING, NULL, NULL },
+    { ST_CONNECTING, EV_MQTT_UP,      ST_ONLINE,     NULL, NULL },
+    { ST_ONLINE,     EV_PUB_OK,       ST_PUBLISHING, NULL, NULL },
+    { ST_ONLINE,     EV_PUB_FAIL,     ST_ONLINE,     NULL, NULL },
+    { ST_PUBLISHING, EV_PUB_OK,       ST_ONLINE,     NULL, NULL },
+    { ST_PUBLISHING, EV_PUB_FAIL,     ST_ONLINE,     NULL, NULL },
+    { ST_ONLINE,     EV_BREAKER_OPEN, ST_ERROR,      NULL, NULL },
+    { ST_PUBLISHING, EV_BREAKER_OPEN, ST_ERROR,      NULL, NULL },
+    { ST_ERROR,      EV_RECOVER,      ST_CONNECTING, NULL, NULL },
 };
 
-/* Forward declarations */
-typedef struct app_context app_ctx_t;
-static void on_enter_connecting(void *ctx);
-static void on_enter_online(void *ctx);
-static void on_enter_backoff(void *ctx);
-static void on_enter_error(void *ctx);
-static bool guard_can_retry(void *ctx);
-
-static const mfsm_state_t fsm_states[] = {
-    [ST_INIT]       = { .name = "INIT"       },
-    [ST_CONNECTING] = { .name = "CONNECTING", .on_enter = on_enter_connecting },
-    [ST_ONLINE]     = { .name = "ONLINE",     .on_enter = on_enter_online     },
-    [ST_PUBLISHING] = { .name = "PUBLISHING"  },
-    [ST_BACKOFF]    = { .name = "BACKOFF",    .on_enter = on_enter_backoff    },
-    [ST_ERROR]      = { .name = "ERROR",      .on_enter = on_enter_error      },
-};
-
-static const mfsm_transition_t fsm_transitions[] = {
-    { ST_INIT,       EV_BOOT_DONE,  ST_CONNECTING, NULL,            NULL },
-    { ST_CONNECTING, EV_CONNECTED,  ST_ONLINE,     NULL,            NULL },
-    { ST_ONLINE,     EV_PUBLISH,    ST_PUBLISHING, NULL,            NULL },
-    { ST_PUBLISHING, EV_PUB_ACK,   ST_ONLINE,     NULL,            NULL },
-    { ST_CONNECTING, EV_DISCONNECT, ST_BACKOFF,    NULL,            NULL },
-    { ST_ONLINE,     EV_DISCONNECT, ST_BACKOFF,    NULL,            NULL },
-    { ST_PUBLISHING, EV_DISCONNECT, ST_BACKOFF,    NULL,            NULL },
-    { ST_BACKOFF,    EV_RETRY,      ST_CONNECTING, guard_can_retry, NULL },
-    { ST_BACKOFF,    EV_RETRY,      ST_ERROR,      NULL,            NULL },
-};
-
-static const mfsm_def_t fsm_def = {
-    .states          = fsm_states,
+static const mfsm_def_t g_fsm_def = {
+    .states          = g_states,
     .num_states      = ST_COUNT,
-    .transitions     = fsm_transitions,
-    .num_transitions = sizeof(fsm_transitions) / sizeof(fsm_transitions[0]),
-    .initial         = ST_INIT,
+    .transitions     = g_transitions,
+    .num_transitions = sizeof(g_transitions) / sizeof(g_transitions[0]),
+    .initial         = ST_BOOT,
 };
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Sensor event (ISR → micoring ring buffer → main loop)
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    uint32_t ts_ms;
+    float    temp;
+    float    hum;
+    uint8_t  seq;
+} sensor_event_t;
+
+static sensor_event_t g_ring_buf[8];  /* power of 2 */
+static mring_t        g_ring;
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * microres — circuit breaker op_fn wrapper
+ *
+ * Real API: mres_breaker_call(br, op_fn, ctx, clock)
+ * op_fn: int (*)(void *ctx) — returns 0=success, negative=fail
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+typedef struct {
+    const char    *topic;
+    const uint8_t *payload;
+    size_t         len;
+    bool           result;
+} mqtt_op_ctx_t;
+
+static int mqtt_publish_op(void *ctx)
+{
+    mqtt_op_ctx_t *op = (mqtt_op_ctx_t *)ctx;
+    /* Simulate 20% failure rate */
+    op->result = (rand() % 5) != 0;
+    MLOG_DEBUG("MQTT","publish %s [%zu B] → %s",
+               op->topic, op->len, op->result ? "OK" : "FAIL");
+    return op->result ? 0 : -1;
+}
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Application context
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-typedef struct {
-    uint8_t event_type;
-    float   value;
-} sensor_event_t;
+struct app_s {
+    /* microconf */
+    node_config_t           config;
 
-struct app_context {
-    /* Subsystems */
-    mfsm_t          fsm;
-    mres_breaker_t  breaker;
-    app_config_t    config;
-    msh_t           shell;
+    /* microfsm */
+    mfsm_t                  fsm;
 
-    /* Sensor event ring buffer */
-    mring_t         event_ring;
-    uint8_t         event_storage[8 * sizeof(sensor_event_t)];
+    /* microres */
+    mres_breaker_t          breaker;
+    mres_retry_t            retry;
 
-    /* State */
-    int             retry_count;
-    uint32_t        last_publish;
-    int             publish_count;
+    /* microlog */
+    mlog_t                  log;
+
+    /* microsh */
+    msh_t                   shell;
+
+    /* microtimer */
+    mtimer_t                timers;
+    int                     tid_report;    /* timer IDs */
+    int                     tid_watchdog;
+    int                     tid_led;
+
+    /* microbus */
+    mbus_t                  bus;
+
+    /* Stats */
+    uint32_t                publish_ok;
+    uint32_t                publish_fail;
+    uint32_t                cbor_total;
+    uint32_t                watchdog_ticks;
+    uint32_t                led_blinks;
+    uint8_t                 sensor_seq;
+
+    /* CBOR scratch */
+    uint8_t                 cbor_buf[64];
 };
 
-static app_ctx_t app;
+static app_t g_app;
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * FSM callbacks
+ * microtimer callbacks
+ *
+ * Real API: mtimer_cb_fn(uint8_t timer_id, void *ctx)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static void on_enter_connecting(void *ctx)
+static void timer_report_cb(uint8_t id, void *ctx)
 {
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    MLOG_INFO("FSM", "Connecting to %s:%d ...",
-              a->config.mqtt_host, a->config.mqtt_port);
+    (void)id;
+    app_t *app = (app_t *)ctx;
+    sensor_event_t ev = {
+        .ts_ms = plat_now_ms(),
+        .temp  = 22.0f + (float)(rand() % 60) / 10.0f,
+        .hum   = 50.0f + (float)(rand() % 200) / 10.0f,
+        .seq   = app->sensor_seq++,
+    };
+    mring_push(&g_ring, &ev);
+    /* ISR-safe deferred bus notify */
+    mbus_queue_signal(&app->bus, MBUS_TOPIC_SENSOR);
 }
 
-static void on_enter_online(void *ctx)
+static void timer_watchdog_cb(uint8_t id, void *ctx)
 {
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    a->retry_count = 0;
-    MLOG_INFO("FSM", "Online and ready (device: %s)", a->config.device_id);
+    (void)id;
+    app_t *app = (app_t *)ctx;
+    app->watchdog_ticks++;
+    uint32_t ticks = app->watchdog_ticks;
+    mbus_publish(&app->bus, MBUS_TOPIC_USER, &ticks, sizeof(ticks));
 }
 
-static void on_enter_backoff(void *ctx)
+static void timer_led_cb(uint8_t id, void *ctx)
 {
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    a->retry_count++;
-    MLOG_WARN("FSM", "Connection lost, retry %d/5", a->retry_count);
-}
-
-static void on_enter_error(void *ctx)
-{
-    (void)ctx;
-    MLOG_ERROR("FSM", "%s", "Fatal: max retries exceeded");
-}
-
-static bool guard_can_retry(void *ctx)
-{
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    return a->retry_count < 5;
-}
-
-/* FSM trace → microlog */
-static void fsm_trace(mfsm_state_id from, mfsm_event_id event,
-                       mfsm_state_id to, void *ctx)
-{
-    (void)ctx;
-    MLOG_DEBUG("FSM", "%s --(%d)--> %s",
-               fsm_states[from].name, event, fsm_states[to].name);
+    (void)id;
+    app_t *app = (app_t *)ctx;
+    app->led_blinks++;
+    uint8_t state = (uint8_t)(app->led_blinks & 1u);
+    mbus_queue(&app->bus, MBUS_TOPIC_USER + 1, &state, sizeof(state));
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Simulated MQTT publish (with resilience)
+ * microbus subscribers
+ *
+ * Real API: mbus_handler_fn(const mbus_event_t *event, void *ctx)
  * ═══════════════════════════════════════════════════════════════════════════ */
 
-static int simulate_mqtt_publish(void *ctx)
+static void on_watchdog_bus(const mbus_event_t *ev, void *ctx)
 {
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    /* Simulate: 80% success rate */
-    int r = rand() % 10;
-    if (r < 8) {
-        a->publish_count++;
+    (void)ctx;
+    uint32_t ticks = 0;
+    if (ev->payload_len >= sizeof(ticks))
+        memcpy(&ticks, ev->payload, sizeof(ticks));
+    MLOG_DEBUG("WDG","Watchdog tick #%lu — system alive", (unsigned long)ticks);
+}
+
+static void on_led_bus(const mbus_event_t *ev, void *ctx)
+{
+    (void)ctx;
+    uint8_t state = ev->payload_len ? ev->payload[0] : 0;
+    MLOG_DEBUG("LED","LED %s", state ? "▮ ON" : "▯ OFF");
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * microcbor encode
+ *
+ * Real API: mcbor_enc_str (NUL-terminated), mcbor_enc_size, mcbor_enc_overflow
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static size_t encode_telemetry(app_t *app, const sensor_event_t *ev)
+{
+    mcbor_enc_t enc;
+    mcbor_enc_init(&enc, app->cbor_buf, sizeof(app->cbor_buf));
+
+    mcbor_enc_map(&enc, 6);
+    mcbor_enc_str(&enc, "id");   mcbor_enc_str(&enc, app->config.device_id);
+    mcbor_enc_str(&enc, "seq");  mcbor_enc_uint(&enc, ev->seq);
+    mcbor_enc_str(&enc, "ts");   mcbor_enc_uint(&enc, ev->ts_ms);
+    mcbor_enc_str(&enc, "t");    mcbor_enc_float(&enc, ev->temp + (float)app->config.temp_offset);
+    mcbor_enc_str(&enc, "h");    mcbor_enc_float(&enc, ev->hum);
+    mcbor_enc_str(&enc, "unit"); mcbor_enc_str(&enc, "C");
+
+    if (mcbor_enc_overflow(&enc)) {
+        MLOG_ERROR("CBOR","%s","Buffer overflow during encode!");
         return 0;
     }
-    return -1;  /* simulated failure */
-}
-
-static void publish_telemetry(app_ctx_t *a, float temp, float hum)
-{
-    /* Encode as CBOR */
-    uint8_t cbor_buf[64];
-    mcbor_enc_t enc;
-    mcbor_enc_init(&enc, cbor_buf, sizeof(cbor_buf));
-
-    mcbor_enc_map(&enc, 4);
-    mcbor_enc_str(&enc, "device"); mcbor_enc_str(&enc, a->config.device_id);
-    mcbor_enc_str(&enc, "temp");   mcbor_enc_float(&enc, temp + a->config.temp_offset);
-    mcbor_enc_str(&enc, "hum");    mcbor_enc_float(&enc, hum);
-    mcbor_enc_str(&enc, "ts");     mcbor_enc_uint(&enc, platform_clock() / 1000);
-
-    uint32_t cbor_size = mcbor_enc_size(&enc);
-    MLOG_DEBUG("CBOR", "Encoded %lu bytes (JSON would be ~60)", (unsigned long)cbor_size);
-
-    /* Publish through circuit breaker */
-    int result = mres_breaker_call(&a->breaker, simulate_mqtt_publish, a,
-                                    platform_clock);
-
-    if (result == MRES_OK) {
-        MLOG_INFO("MQTT", "Published #%d (%.1f°C, %.0f%%)",
-                  a->publish_count, temp, hum);
-    } else if (result == MRES_ERR_OPEN) {
-        uint32_t wait = mres_breaker_remaining_ms(&a->breaker, platform_clock);
-        MLOG_WARN("MQTT", "Breaker OPEN, retry in %lu ms", (unsigned long)wait);
-    } else {
-        MLOG_ERROR("MQTT", "Publish failed: %d", result);
-    }
+    return (size_t)mcbor_enc_size(&enc);
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Shell commands (microsh)
+ * microsh commands
+ *
+ * Real API: msh_cmd_fn(int argc, const char **argv, void *ctx) → int
+ * Register: msh_register(sh, name, help, handler)
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+static int cmd_help(int argc, const char **argv, void *ctx)
+{
+    (void)argc; (void)argv;
+    app_t *app = (app_t *)ctx;
+    uint8_t n = msh_command_count(&app->shell);
+    for (uint8_t i = 0; i < n; i++) {
+        const msh_cmd_t *c = msh_command_at(&app->shell, i);
+        printf("  %-12s %s\n", c->name, c->help ? c->help : "");
+    }
+    return 0;
+}
 
 static int cmd_status(int argc, const char **argv, void *ctx)
 {
     (void)argc; (void)argv;
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    char buf[128];
-
-    snprintf(buf, sizeof(buf),
-             "State:     %s\r\n"
-             "Breaker:   %s (%d failures)\r\n"
-             "Published: %d messages\r\n"
-             "Events:    %lu/%lu in ring\r\n",
-             mfsm_state_name(&a->fsm),
-             mres_breaker_state_name(&a->breaker),
-             a->breaker.failure_count,
-             a->publish_count,
-             (unsigned long)mring_count(&a->event_ring),
-             (unsigned long)mring_capacity(&a->event_ring));
-    shell_print(buf, NULL);
+    app_t *app = (app_t *)ctx;
+    printf("State     : %s\n",   mfsm_state_name(&app->fsm));
+    printf("Published : %lu OK / %lu FAIL\n",
+           (unsigned long)app->publish_ok, (unsigned long)app->publish_fail);
+    printf("CBOR total: %lu B\n",(unsigned long)app->cbor_total);
+    printf("Breaker   : %s\n",   mres_breaker_state_name(&app->breaker));
+    printf("Ring      : %lu pending\n", (unsigned long)mring_count(&g_ring));
+    printf("WDG ticks : %lu\n",  (unsigned long)app->watchdog_ticks);
+    printf("LED blinks: %lu\n",  (unsigned long)app->led_blinks);
     return 0;
 }
 
 static int cmd_conf(int argc, const char **argv, void *ctx)
 {
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    char buf[128];
+    app_t *app = (app_t *)ctx;
+    if (argc < 2) { printf("Usage: conf list | conf get <key>\n"); return -1; }
 
-    if (argc < 2) {
-        shell_print("Usage: conf list | conf get <key>\r\n", NULL);
-        return 0;
+    if (!strcmp(argv[1], "list")) {
+        for (uint8_t i = 0; i < g_schema.num_entries; i++) {
+            const mconf_entry_t *e = &g_schema.entries[i];
+            printf("  %-20s", e->key);
+            if (e->type == MCONF_TYPE_STR) {
+                char buf[32]; mconf_get_str(&g_schema, &app->config, i, buf, sizeof(buf));
+                printf(" = \"%s\"\n", buf);
+            } else if (e->type == MCONF_TYPE_U32) {
+                uint32_t v; mconf_get_u32(&g_schema, &app->config, i, &v);
+                printf(" = %lu\n", (unsigned long)v);
+            } else {
+                int32_t v; mconf_get_i32(&g_schema, &app->config, i, &v);
+                printf(" = %ld\n", (long)v);
+            }
+        }
+    } else if (argc >= 3 && !strcmp(argv[1], "get")) {
+        int idx = mconf_find(&g_schema, argv[2]);
+        if (idx < 0) { printf("Key not found: %s\n", argv[2]); return -1; }
+        const mconf_entry_t *e = &g_schema.entries[idx];
+        if (e->type == MCONF_TYPE_STR) {
+            char buf[32]; mconf_get_str(&g_schema, &app->config, (uint8_t)idx, buf, sizeof(buf));
+            printf("%s = \"%s\"\n", argv[2], buf);
+        } else if (e->type == MCONF_TYPE_U32) {
+            uint32_t v; mconf_get_u32(&g_schema, &app->config, (uint8_t)idx, &v);
+            printf("%s = %lu\n", argv[2], (unsigned long)v);
+        } else {
+            int32_t v; mconf_get_i32(&g_schema, &app->config, (uint8_t)idx, &v);
+            printf("%s = %ld\n", argv[2], (long)v);
+        }
     }
-
-    if (strcmp(argv[1], "list") == 0) {
-        for (uint8_t i = 0; i < config_schema.num_entries; i++) {
-            snprintf(buf, sizeof(buf), "  [%d] %s (%s)\r\n",
-                     i, config_entries[i].key,
-                     mconf_type_name(config_entries[i].type));
-            shell_print(buf, NULL);
-        }
-        return 0;
-    }
-
-    if (strcmp(argv[1], "get") == 0 && argc >= 3) {
-        int idx = mconf_find(&config_schema, argv[2]);
-        if (idx < 0) {
-            shell_print("Key not found\r\n", NULL);
-            return -1;
-        }
-
-        const mconf_entry_t *e = &config_entries[idx];
-        switch (e->type) {
-        case MCONF_TYPE_STR: {
-            char val[64];
-            mconf_get_str(&config_schema, &a->config, (uint8_t)idx, val, sizeof(val));
-            snprintf(buf, sizeof(buf), "%s = \"%s\"\r\n", argv[2], val);
-            break;
-        }
-        case MCONF_TYPE_U16: {
-            uint16_t val;
-            mconf_get_u16(&config_schema, &a->config, (uint8_t)idx, &val);
-            snprintf(buf, sizeof(buf), "%s = %u\r\n", argv[2], val);
-            break;
-        }
-        case MCONF_TYPE_U32: {
-            uint32_t val;
-            mconf_get_u32(&config_schema, &a->config, (uint8_t)idx, &val);
-            snprintf(buf, sizeof(buf), "%s = %lu\r\n", argv[2], (unsigned long)val);
-            break;
-        }
-        case MCONF_TYPE_FLOAT: {
-            float val;
-            mconf_get_float(&config_schema, &a->config, (uint8_t)idx, &val);
-            snprintf(buf, sizeof(buf), "%s = %.3f\r\n", argv[2], (double)val);
-            break;
-        }
-        case MCONF_TYPE_BOOL: {
-            bool val;
-            mconf_get_bool(&config_schema, &a->config, (uint8_t)idx, &val);
-            snprintf(buf, sizeof(buf), "%s = %s\r\n", argv[2], val ? "true" : "false");
-            break;
-        }
-        default:
-            snprintf(buf, sizeof(buf), "%s = (unsupported type)\r\n", argv[2]);
-            break;
-        }
-        shell_print(buf, NULL);
-        return 0;
-    }
-
-    shell_print("Usage: conf list | conf get <key>\r\n", NULL);
     return 0;
 }
 
-static int cmd_log_level(int argc, const char **argv, void *ctx)
+static int cmd_cbor(int argc, const char **argv, void *ctx)
 {
-    (void)ctx;
-    if (argc < 2) {
-        char buf[64];
-        snprintf(buf, sizeof(buf), "Current level: %s\r\n",
-                 mlog_level_name(mlog_global()->global_level));
-        shell_print(buf, NULL);
-        return 0;
-    }
-
-    mlog_level_t level = MLOG_INFO;
-    if      (strcmp(argv[1], "trace") == 0) level = MLOG_TRACE;
-    else if (strcmp(argv[1], "debug") == 0) level = MLOG_DEBUG;
-    else if (strcmp(argv[1], "info")  == 0) level = MLOG_INFO;
-    else if (strcmp(argv[1], "warn")  == 0) level = MLOG_WARN;
-    else if (strcmp(argv[1], "error") == 0) level = MLOG_ERROR;
-    else {
-        shell_print("Levels: trace, debug, info, warn, error\r\n", NULL);
-        return -1;
-    }
-
-    mlog_set_level(NULL, level);
-    char buf[64];
-    snprintf(buf, sizeof(buf), "Log level set to %s\r\n", mlog_level_name(level));
-    shell_print(buf, NULL);
+    (void)argc; (void)argv;
+    app_t *app = (app_t *)ctx;
+    sensor_event_t ev = { .ts_ms = plat_now_ms(), .temp = 23.5f, .hum = 61.2f, .seq = 0xFF };
+    size_t len = encode_telemetry(app, &ev);
+    printf("CBOR payload (%zu bytes):\n  ", len);
+    for (size_t i = 0; i < len; i++) printf("%02X ", app->cbor_buf[i]);
+    printf("\n");
     return 0;
 }
 
 static int cmd_breaker(int argc, const char **argv, void *ctx)
 {
-    app_ctx_t *a = (app_ctx_t *)ctx;
-    char buf[128];
-
-    if (argc >= 2 && strcmp(argv[1], "reset") == 0) {
-        mres_breaker_reset(&a->breaker);
-        shell_print("Breaker reset to CLOSED\r\n", NULL);
-        return 0;
-    }
-
-    snprintf(buf, sizeof(buf), "Breaker: %s (failures: %d/%d)\r\n",
-             mres_breaker_state_name(&a->breaker),
-             a->breaker.failure_count,
-             a->breaker.policy->failure_threshold);
-    shell_print(buf, NULL);
-
-    if (a->breaker.state == MRES_BREAKER_OPEN) {
-        uint32_t remaining = mres_breaker_remaining_ms(&a->breaker, platform_clock);
-        snprintf(buf, sizeof(buf), "Recovery in: %lu ms\r\n", (unsigned long)remaining);
-        shell_print(buf, NULL);
-    }
+    (void)argc; (void)argv;
+    app_t *app = (app_t *)ctx;
+    printf("Breaker   : %s\n",   mres_breaker_state_name(&app->breaker));
+    printf("Failures  : %d/%d\n", app->breaker.failure_count,
+           app->breaker.policy ? app->breaker.policy->failure_threshold : 0);
     return 0;
+}
+
+static int cmd_bus(int argc, const char **argv, void *ctx)
+{
+    (void)argc; (void)argv;
+    app_t *app = (app_t *)ctx;
+    printf("Publishes : %lu\n",  (unsigned long)mbus_publish_count(&app->bus));
+    printf("Deliveries: %lu\n",  (unsigned long)mbus_deliver_count(&app->bus));
+    printf("Dropped   : %lu\n",  (unsigned long)mbus_drop_count(&app->bus));
+    printf("Subscribers: %d\n",  mbus_subscriber_count(&app->bus));
+    printf("Queue     : %lu pending\n", (unsigned long)mbus_queue_count(&app->bus));
+    return 0;
+}
+
+static int cmd_timers(int argc, const char **argv, void *ctx)
+{
+    (void)argc; (void)argv;
+    app_t *app = (app_t *)ctx;
+    const char *names[] = {"report","watchdog","led_blink"};
+    int ids[] = { app->tid_report, app->tid_watchdog, app->tid_led };
+    printf("Timers:\n");
+    for (int i = 0; i < 3; i++) {
+        if (ids[i] < 0) { printf("  [?] %-12s NOT CREATED\n", names[i]); continue; }
+        mtimer_state_t st = mtimer_state(&app->timers, (uint8_t)ids[i]);
+        uint32_t fires    = mtimer_fire_count(&app->timers, (uint8_t)ids[i]);
+        printf("  [%d] %-12s %s  fires=%lu\n",
+               ids[i], names[i], mtimer_state_str(st), (unsigned long)fires);
+    }
+    printf("Total fires: %lu\n", (unsigned long)mtimer_total_fires(&app->timers));
+    return 0;
+}
+
+static int cmd_log(int argc, const char **argv, void *ctx)
+{
+    app_t *app = (app_t *)ctx;
+    if (argc < 2) { printf("Usage: log <debug|info|warn|error>\n"); return -1; }
+    mlog_level_t lv = MLOG_DEBUG;
+    if      (!strcmp(argv[1],"debug")) lv = MLOG_DEBUG;
+    else if (!strcmp(argv[1],"info"))  lv = MLOG_INFO;
+    else if (!strcmp(argv[1],"warn"))  lv = MLOG_WARN;
+    else if (!strcmp(argv[1],"error")) lv = MLOG_ERROR;
+    else { printf("Unknown level: %s\n", argv[1]); return -1; }
+    mlog_set_level(&app->log, lv);
+    printf("Log level → %s\n", argv[1]);
+    return 0;
+}
+
+static const mres_retry_policy_t g_retry_policy = {
+    .max_attempts  = 8,
+    .base_delay_ms = 500,
+    .max_delay_ms  = 16000,
+    .strategy      = MRES_BACKOFF_EXPONENTIAL,
+    .jitter        = true,
+};
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Initialisation — all 9 subsystems
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void app_init(app_t *app)
+{
+    /* ── 1. microlog ──────────────────────────────────────────────────────
+     * mlog_init + mlog_add_backend + mlog_set_clock
+     */
+    mlog_init(&app->log);
+    mlog_set_clock(&app->log, plat_now_ms);
+    mlog_backend_t backend = {
+        .write = stdout_write,
+        .ctx   = NULL,
+        .level = MLOG_DEBUG,
+#if MLOG_ENABLE_COLOR
+        .color = true,
+#endif
+    };
+    mlog_add_backend(&app->log, &backend);
+    /* Point global logger at our instance so MLOG_* macros work */
+    *mlog_global() = app->log;
+    MLOG_INFO("BOOT","%s","=== IoT Sensor Node -- all 9 micro-toolkit libraries (real API) ===");
+
+    /* ── 2. microconf ────────────────────────────────────────────────────
+     * mconf_load falls back to defaults on first boot (no valid flash)
+     * Access via mconf_find(schema, key) → index
+     */
+    mconf_err_t cerr = mconf_load(&g_schema, &app->config, &g_flash_io);
+    if (cerr != MCONF_OK) {
+        mconf_load_defaults(&g_schema, &app->config);
+        MLOG_WARN("CONF","Load failed (%d) — using defaults", cerr);
+    } else {
+        MLOG_INFO("CONF","%s","Loaded from flash (CRC OK)");
+    }
+    MLOG_INFO("CONF","%s @ %s:%lu  interval=%lu ms",
+              app->config.device_id, app->config.mqtt_host,
+              (unsigned long)app->config.mqtt_port,
+              (unsigned long)app->config.report_ms);
+
+    /* ── 3. micoring ─────────────────────────────────────────────────────
+     * mring_init(ring, buf, capacity, elem_size)
+     */
+    mring_init(&g_ring, g_ring_buf, 8, sizeof(sensor_event_t));
+    MLOG_DEBUG("RING","Ring buffer ready — capacity=%lu, elem=%lu B",
+               (unsigned long)mring_capacity(&g_ring),
+               (unsigned long)sizeof(sensor_event_t));
+
+    /* ── 4. microres ─────────────────────────────────────────────────────
+     * mres_breaker_init(br, policy)  — clock passed to _call/_report later
+     * mres_retry_init(retry, policy)
+     */
+    static const mres_breaker_policy_t brk_policy = {
+        .failure_threshold  = 3,
+        .recovery_timeout_ms= 10000,
+        .half_open_max_calls= 1,
+    };
+    mres_breaker_init(&app->breaker, &brk_policy);
+
+    mres_retry_init(&app->retry, &g_retry_policy);
+
+    /* ── 5. microfsm ─────────────────────────────────────────────────────
+     * mfsm_init(fsm, def, user_data)  — def is const ROM struct
+     */
+    mfsm_init(&app->fsm, &g_fsm_def, app);
+
+    /* ── 6. microbus ─────────────────────────────────────────────────────
+     * mbus_init(bus, clock_fn)
+     * mbus_subscribe(bus, topic_uint8, handler, ctx)
+     */
+    mbus_init(&app->bus, plat_now_ms);
+    mbus_subscribe(&app->bus, (uint8_t)MBUS_TOPIC_USER,      on_watchdog_bus, app);
+    mbus_subscribe(&app->bus, (uint8_t)(MBUS_TOPIC_USER + 1),on_led_bus,      app);
+    MLOG_DEBUG("BUS","Event bus ready — %d subscribers", mbus_subscriber_count(&app->bus));
+
+    /* ── 7. microtimer ───────────────────────────────────────────────────
+     * mtimer_init(tm, clock_fn)
+     * mtimer_create(tm, name, interval, mode, callback, ctx) → id
+     * mtimer_start(tm, id)
+     */
+    mtimer_init(&app->timers, plat_now_ms);
+    app->tid_report   = mtimer_create(&app->timers, "report",   150,   MTIMER_PERIODIC, timer_report_cb,   app);
+    app->tid_watchdog = mtimer_create(&app->timers, "watchdog", 10000, MTIMER_PERIODIC, timer_watchdog_cb, app);
+    app->tid_led      = mtimer_create(&app->timers, "led_blink",500,   MTIMER_PERIODIC, timer_led_cb,      app);
+    mtimer_start(&app->timers, (uint8_t)app->tid_report);
+    mtimer_start(&app->timers, (uint8_t)app->tid_watchdog);
+    mtimer_start(&app->timers, (uint8_t)app->tid_led);
+    MLOG_DEBUG("TMR","%s","3 timers created + started (report=150ms, watchdog=10s, led=500ms)");
+
+    /* ── 8. microsh ──────────────────────────────────────────────────────
+     * msh_init(sh, print_fn, ctx)
+     * msh_register(sh, name, help, handler) — registers one command at a time
+     * msh_set_prompt(sh, str)
+     */
+    msh_init(&app->shell, shell_print, app);
+    msh_set_prompt(&app->shell, "\033[36msensor>\033[0m ");
+    msh_register(&app->shell, "help",    "show all commands",     cmd_help);
+    msh_register(&app->shell, "status",  "device state/counters", cmd_status);
+    msh_register(&app->shell, "conf",    "list | get <key>",      cmd_conf);
+    msh_register(&app->shell, "cbor",    "encode + hex dump",     cmd_cbor);
+    msh_register(&app->shell, "breaker", "circuit breaker state", cmd_breaker);
+    msh_register(&app->shell, "bus",     "event bus stats",       cmd_bus);
+    msh_register(&app->shell, "timers",  "active timers",         cmd_timers);
+    msh_register(&app->shell, "log",     "set log level",         cmd_log);
+    MLOG_INFO("SHELL","Debug shell ready — %d commands registered",
+              msh_command_count(&app->shell));
+
+    /* ── 9. Save config ──────────────────────────────────────────────────*/
+    mconf_save(&g_schema, &app->config, &g_flash_io);
+    MLOG_INFO("BOOT","%s","All 9 subsystems initialised ✓");
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * Main
+ * Main loop tick
  * ═══════════════════════════════════════════════════════════════════════════ */
+
+static void app_tick(app_t *app)
+{
+    /* 1. microtimer tick → fires report/watchdog/LED callbacks */
+    mtimer_tick(&app->timers);
+
+    /* 2. microbus dispatch → delivers deferred ISR queue events */
+    mbus_dispatch(&app->bus);
+
+    /* 3. Drain micoring → encode CBOR → breaker → MQTT */
+    sensor_event_t ev;
+    while (mring_pop(&g_ring, &ev) == MRING_OK) {
+
+        MLOG_DEBUG("SENSOR","seq=%d  T=%.1f°C  H=%.1f%%",
+                   ev.seq, (double)ev.temp, (double)ev.hum);
+
+        size_t cbor_len = encode_telemetry(app, &ev);
+        if (!cbor_len) continue;
+        app->cbor_total += (uint32_t)cbor_len;
+        MLOG_DEBUG("CBOR","Encoded %zu B (vs ~80 JSON)", cbor_len);
+
+        /* Build topic */
+        char topic[128];
+        snprintf(topic, sizeof(topic), "sensors/%s/telemetry", app->config.device_id);
+
+        /* microres — circuit breaker call via op_fn */
+        mqtt_op_ctx_t op_ctx = { .topic = topic, .payload = app->cbor_buf, .len = cbor_len };
+        int bres = mres_breaker_call(&app->breaker, mqtt_publish_op, &op_ctx, plat_now_ms);
+
+        if (bres == MRES_ERR_OPEN) {
+            MLOG_WARN("MQTT","%s","Breaker OPEN — publish blocked");
+            mbus_signal(&app->bus, MBUS_TOPIC_NETWORK);
+            mfsm_dispatch(&app->fsm, EV_BREAKER_OPEN);
+            return;
+        }
+
+        if (bres == MRES_OK) {
+            app->publish_ok++;
+            MLOG_INFO("MQTT","[%lu] OK  %zu B → %s",
+                      (unsigned long)app->publish_ok, cbor_len, topic);
+            mbus_signal(&app->bus, MBUS_TOPIC_NETWORK);
+            mfsm_dispatch(&app->fsm, EV_PUB_OK);
+        } else {
+            app->publish_fail++;
+            uint32_t delay = mres_delay_calc(&g_retry_policy, (uint8_t)app->retry.attempts, plat_now_ms);
+            MLOG_WARN("MQTT","FAIL #%lu — next retry in %lu ms",
+                      (unsigned long)app->publish_fail, (unsigned long)delay);
+            mbus_signal(&app->bus, MBUS_TOPIC_NETWORK);
+            mfsm_dispatch(&app->fsm, EV_PUB_FAIL);
+        }
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * Entry point
+ * ═══════════════════════════════════════════════════════════════════════════ */
+
+#ifdef PLATFORM_ESP32
+
+void app_main(void)
+{
+    nvs_flash_init();
+    app_init(&g_app);
+    mfsm_dispatch(&g_app.fsm, EV_BOOT_DONE);
+    plat_sleep_ms(500); mfsm_dispatch(&g_app.fsm, EV_WIFI_UP);
+    plat_sleep_ms(500); mfsm_dispatch(&g_app.fsm, EV_MQTT_UP);
+    for (;;) { app_tick(&g_app); plat_sleep_ms(50); }
+}
+
+#else /* PLATFORM_LINUX */
 
 int main(void)
 {
-    srand((unsigned)time(NULL));
-    memset(&app, 0, sizeof(app));
-    memset(fake_flash, 0xFF, sizeof(fake_flash));
+    srand(42);
+    app_init(&g_app);
 
-    /* ── 1. Init logging (microlog) ────────────────────────────────────── */
+    mfsm_dispatch(&g_app.fsm, EV_BOOT_DONE);
+    plat_sleep_ms(50);
+    mfsm_dispatch(&g_app.fsm, EV_WIFI_UP);
+    plat_sleep_ms(50);
+    mfsm_dispatch(&g_app.fsm, EV_MQTT_UP);
 
-    mlog_t *log = mlog_global();
-    mlog_init(log);
-    mlog_set_clock(log, platform_clock);
-
-    mlog_backend_t log_be = {
-        .write = log_write,
-        .ctx   = NULL,
-        .level = MLOG_DEBUG,
-        .color = true,
-    };
-    mlog_add_backend(log, &log_be);
-
-    MLOG_INFO("BOOT", "%s", "=== IoT Sensor Node starting ===");
-
-    /* ── 2. Load config (microconf) ────────────────────────────────────── */
-
-    mconf_err_t conf_err = mconf_load(&config_schema, &app.config, &flash_io);
-    if (conf_err == MCONF_OK) {
-        MLOG_INFO("CONF", "%s", "Config loaded from flash");
-    } else {
-        MLOG_WARN("CONF", "Using defaults (%s)", mconf_err_str(conf_err));
-    }
-
-    MLOG_INFO("CONF", "Host: %s:%d, Device: %s, Interval: %lu ms",
-              app.config.mqtt_host, app.config.mqtt_port,
-              app.config.device_id,
-              (unsigned long)app.config.report_interval_ms);
-
-    /* ── 3. Init ring buffer (micoring) ────────────────────────────────── */
-
-    mring_init(&app.event_ring, app.event_storage, 8, sizeof(sensor_event_t));
-    MLOG_DEBUG("RING", "Event ring: %lu slots", (unsigned long)mring_capacity(&app.event_ring));
-
-    /* ── 4. Init state machine (microfsm) ──────────────────────────────── */
-
-    mfsm_validate(&fsm_def);
-    mfsm_init(&app.fsm, &fsm_def, &app);
-    mfsm_set_trace(&app.fsm, fsm_trace);
-
-    /* ── 5. Init circuit breaker (microres) ────────────────────────────── */
-
-    static const mres_breaker_policy_t breaker_policy = {
-        .failure_threshold   = 3,
-        .recovery_timeout_ms = 10000,
-        .half_open_max_calls = 1,
-    };
-    mres_breaker_init(&app.breaker, &breaker_policy);
-
-    /* ── 6. Init debug shell (microsh) ─────────────────────────────────── */
-
-    msh_init(&app.shell, shell_print, &app);
-    msh_register(&app.shell, "status",  "Show device status",    cmd_status);
-    msh_register(&app.shell, "conf",    "Config: list | get <key>", cmd_conf);
-    msh_register(&app.shell, "log",     "Set log level",         cmd_log_level);
-    msh_register(&app.shell, "breaker", "Circuit breaker status", cmd_breaker);
-
-    /* ── 7. Boot sequence ──────────────────────────────────────────────── */
-
-    MLOG_INFO("BOOT", "%s", "All subsystems initialized");
-    mfsm_dispatch(&app.fsm, EV_BOOT_DONE);
-
-    /* Simulate successful connection */
-    platform_sleep(500);
-    mfsm_dispatch(&app.fsm, EV_CONNECTED);
-
-    /* ── 8. Main loop (simulation) ─────────────────────────────────────── */
-
-    MLOG_INFO("MAIN", "%s", "Entering main loop (5 cycles)...");
-    printf("\n");
-
-    for (int cycle = 0; cycle < 5; cycle++) {
-        /* Simulate sensor readings */
-        float temp = 20.0f + (float)(rand() % 100) / 10.0f;
-        float hum  = 40.0f + (float)(rand() % 400) / 10.0f;
-
-        /* Push to ring buffer (simulating ISR) */
-        sensor_event_t evt = { .event_type = EV_PUBLISH, .value = temp };
-        mring_push(&app.event_ring, &evt);
-
-        /* Process events from ring */
-        sensor_event_t out;
-        while (mring_pop(&app.event_ring, &out) == MRING_OK) {
-            mfsm_dispatch(&app.fsm, EV_PUBLISH);
-            publish_telemetry(&app, temp, hum);
-            mfsm_dispatch(&app.fsm, EV_PUB_ACK);
+    MLOG_INFO("MAIN","%s","Running 10 ticks...");
+    for (int i = 0; i < 10; i++) {
+        MLOG_INFO("MAIN","─── Tick %d ───", i + 1);
+        app_tick(&g_app);
+        if (mfsm_current(&g_app.fsm) == ST_ERROR) {
+            plat_sleep_ms(100);
+            mres_breaker_reset(&g_app.breaker);
+            mfsm_dispatch(&g_app.fsm, EV_RECOVER);
+            mfsm_dispatch(&g_app.fsm, EV_MQTT_UP);
         }
-
-        platform_sleep(1000);
+        plat_sleep_ms(200);
     }
 
-    /* ── 9. Save config before shutdown ────────────────────────────────── */
-
-    mconf_save(&config_schema, &app.config, &flash_io);
-    MLOG_INFO("CONF", "%s", "Config saved to flash");
-
-    /* ── 10. Show final status ─────────────────────────────────────────── */
-
+    /* Shell demo */
     printf("\n");
-    MLOG_INFO("MAIN", "%s", "=== Simulation complete ===");
-    MLOG_INFO("MAIN", "Final state: %s", mfsm_state_name(&app.fsm));
-    MLOG_INFO("MAIN", "Published: %d messages", app.publish_count);
-    MLOG_INFO("MAIN", "Breaker: %s", mres_breaker_state_name(&app.breaker));
+    MLOG_INFO("SHELL","%s","=== Debug Shell Demo ===");
+    const char *demo[] = { "help","status","conf list","conf get device_id","cbor","breaker","bus","timers" };
+    for (size_t i = 0; i < sizeof(demo)/sizeof(demo[0]); i++) {
+        printf("\n");
+        msh_prompt(&g_app.shell);
+        printf("%s\n", demo[i]);
+        msh_exec(&g_app.shell, demo[i]);
+    }
 
-    /* ── Show shell demo ───────────────────────────────────────────────── */
-
-    printf("\n--- Shell demo ---\n");
-    msh_prompt(&app.shell);
-    msh_exec(&app.shell, "status");
+    mconf_save(&g_schema, &g_app.config, &g_flash_io);
     printf("\n");
-    msh_exec(&app.shell, "conf list");
-    printf("\n");
-    msh_exec(&app.shell, "conf get mqtt_host");
-    msh_exec(&app.shell, "conf get report_interval_ms");
-    msh_exec(&app.shell, "breaker");
-
+    MLOG_INFO("MAIN","%s","=== Complete ===");
+    MLOG_INFO("MAIN","State    : %s",  mfsm_state_name(&g_app.fsm));
+    MLOG_INFO("MAIN","Published: %lu OK / %lu FAIL",
+              (unsigned long)g_app.publish_ok, (unsigned long)g_app.publish_fail);
+    MLOG_INFO("MAIN","CBOR     : %lu B", (unsigned long)g_app.cbor_total);
+    MLOG_INFO("MAIN","Breaker  : %s",  mres_breaker_state_name(&g_app.breaker));
+    MLOG_INFO("MAIN","WDG ticks: %lu", (unsigned long)g_app.watchdog_ticks);
+    MLOG_INFO("MAIN","LED blinks:%lu", (unsigned long)g_app.led_blinks);
+    MLOG_INFO("MAIN","Timer fires:%lu",  (unsigned long)mtimer_total_fires(&g_app.timers));
+    MLOG_INFO("MAIN","Bus publishes:%lu",(unsigned long)mbus_publish_count(&g_app.bus));
     return 0;
 }
+
+#endif /* PLATFORM_LINUX */

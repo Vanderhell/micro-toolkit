@@ -33,6 +33,7 @@ one problem each, compose cleanly, and share a common philosophy:
 │  microsh ─── debug shell (runtime access to everything)     │
 ├─────────────────────────────────────────────────────────────┤
 │  microlog ── structured logging (observability glue)        │
+│  microbus ── event pub/sub bus (decouples all modules)      │
 ├───────────┬───────────┬───────────┬──────────┬──────────────┤
 │ microfsm  │ microres  │ microconf │microcbor │   micoring   │
 │           │           │           │          │              │
@@ -42,6 +43,8 @@ one problem each, compose cleanly, and share a common philosophy:
 │           │ rate      │ defaults  │          │ SPSC         │
 │           │ limiter   │           │          │              │
 ├───────────┴───────────┴───────────┴──────────┴──────────────┤
+│  microtimer ── software timer manager (oneshot + periodic)  │
+├─────────────────────────────────────────────────────────────┤
 │  iotspool ── persistent MQTT queue                          │
 │  nvlog ── power-loss safe append log                        │
 ├─────────────────────────────────────────────────────────────┤
@@ -61,8 +64,10 @@ one problem each, compose cleanly, and share a common philosophy:
 | [**microsh**](https://github.com/Vanderhell/microsh) | Debug shell with history + tab completion | 680 | 43 | [README](https://github.com/Vanderhell/microsh#readme) |
 | [**microcbor**](https://github.com/Vanderhell/microcbor) | Minimal CBOR encoder/decoder (RFC 8949) | 750 | 43 | [README](https://github.com/Vanderhell/microcbor#readme) |
 | [**micoring**](https://github.com/Vanderhell/micoring) | Generic ISR-safe ring buffer (SPSC) | 423 | 33 | [README](https://github.com/Vanderhell/micoring#readme) |
+| [**microtimer**](https://github.com/Vanderhell/microtimer) | Software timer manager — oneshot + periodic, drift-corrected | — | 25 | [README](https://github.com/Vanderhell/microtimer#readme) |
+| [**microbus**](https://github.com/Vanderhell/microbus) | Event pub/sub bus — topic-based, ISR-safe deferred queue | — | 34 | [README](https://github.com/Vanderhell/microbus#readme) |
 
-**Total: 4,391 lines of engine code · 269 tests**
+**Total: 4,391 lines of engine code · 328 tests**
 
 ## Companion libraries
 
@@ -107,43 +112,47 @@ Every library in the toolkit follows the same rules:
 
 ```
                  ┌──────────┐
-    Sensors ────▶│ micoring  │──── event queue ────▶ microfsm
+    Sensors ────▶│ micoring  │──── ring buffer ────▶ main loop
                  └──────────┘                        │
-                                                     │ state transitions
-                                                     ▼
-                                                  microlog ──▶ UART / RTT
-                                                     │
-                                          ┌──────────┴──────────┐
-                                          ▼                      ▼
-                                      microres               microconf
-                                    retry + breaker          load config
-                                          │                      │
-                                          ▼                      │
-                                      microcbor                  │
-                                    encode telemetry             │
-                                          │                      │
-                                          ▼                      │
-                                      iotspool ◀─── endpoints ──┘
-                                    queue for MQTT
-                                          │
-                                          ▼
-                                     MQTT broker
+    Timers ──────▶ microtimer │──── callbacks ───────┘
+                 └──────────┘          │
+                                       ▼
+                                    microbus ──── pub/sub events ────▶ subscribers
+                                       │
+                                       ▼
+                                    microfsm ──── state transitions
+                                       │
+                              ┌────────┴────────┐
+                              ▼                  ▼
+                          microres           microconf
+                        retry + breaker     load config
+                              │
+                              ▼
+                          microcbor
+                        encode telemetry
+                              │
+                              ▼
+                          iotspool ──── queue for MQTT ────▶ broker
 ```
 
 **And microsh gives you runtime access to all of it:**
 
 ```
-> fsm state
-Current: ONLINE
+sensor> status
+State     : ONLINE
+Published : 8 OK / 1 FAIL
+Breaker   : CLOSED
 
-> conf get mqtt_host
+sensor> conf get mqtt_host
 mqtt_host = broker.local
 
-> log level debug
-Log level set to DEBUG
+sensor> timers
+  [0] report       RUNNING  fires=9
+  [1] watchdog     RUNNING  fires=0
+  [2] led_blink    RUNNING  fires=3
 
-> breaker status
-Breaker: CLOSED (0 failures)
+sensor> bus
+Publishes : 21  Deliveries: 3  Dropped: 0
 ```
 
 ## Quick start
@@ -159,6 +168,8 @@ Breaker: CLOSED (0 failures)
 | Debug a running device over UART | microsh |
 | Send compact sensor data over MQTT | microcbor |
 | Buffer UART bytes or events from ISR | micoring |
+| Schedule oneshot and periodic callbacks | microtimer |
+| Decouple modules via events (no globals) | microbus |
 | Queue MQTT messages through power loss | iotspool |
 | Append log entries to flash (power-safe) | nvlog |
 | Auto-cleanup resources (free, fclose) | defer / cguard |
@@ -171,15 +182,17 @@ Breaker: CLOSED (0 failures)
 Each library is two files. Copy them, or use git submodules:
 
 ```bash
-git submodule add https://github.com/Vanderhell/microfsm.git  lib/microfsm
-git submodule add https://github.com/Vanderhell/microres.git   lib/microres
-git submodule add https://github.com/Vanderhell/microconf.git  lib/microconf
+git submodule add https://github.com/Vanderhell/microfsm.git    lib/microfsm
+git submodule add https://github.com/Vanderhell/microres.git    lib/microres
+git submodule add https://github.com/Vanderhell/microconf.git   lib/microconf
+git submodule add https://github.com/Vanderhell/microtimer.git  lib/microtimer
+git submodule add https://github.com/Vanderhell/microbus.git    lib/microbus
 # ... add what you need
 ```
 
 ## Example: IoT sensor node
 
-A complete example showing all 7 core libraries working together is in
+A complete example showing all 9 core libraries working together is in
 [`examples/iot-sensor-node/`](examples/iot-sensor-node/).
 
 ## Supported platforms
@@ -202,4 +215,3 @@ All libraries are MIT licensed.
 
 Built by [Vanderhell](https://github.com/Vanderhell) — embedded systems
 developer focused on industrial IoT, Modbus, and MQTT.
-
