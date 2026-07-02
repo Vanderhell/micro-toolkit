@@ -79,3 +79,11 @@ target_compile_definitions(micro_toolkit_iot_sensor_node PRIVATE
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
     target_compile_options(micro_toolkit_iot_sensor_node PRIVATE -Wall -Wextra -Wpedantic -Werror)
 endif()
+
+add_test(
+    NAME iot_sensor_node_smoke
+    COMMAND ${CMAKE_COMMAND}
+        -DTEST_EXE_DIR=${CMAKE_CURRENT_BINARY_DIR}
+        -DCMAKE_EXECUTABLE_SUFFIX=${CMAKE_EXECUTABLE_SUFFIX}
+        -P ${CMAKE_CURRENT_SOURCE_DIR}/run_smoke_test.cmake
+)

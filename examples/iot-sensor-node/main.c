@@ -729,11 +729,6 @@ static bool app_init_config(app_t *app)
             MLOG_ERROR("CONF", "defaults failed: %s", mconf_err_str(status));
             return false;
         }
-        status = mconf_save(&app->config_ctx, &app->config_io);
-        if (status != MCONF_OK) {
-            MLOG_ERROR("CONF", "save failed: %s", mconf_err_str(status));
-            return false;
-        }
     }
 
     MLOG_INFO("CONF", "%s %s:%lu interval=%lu",
