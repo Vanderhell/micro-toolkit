@@ -42,6 +42,15 @@ cmake -S . -B build -DMICRO_TOOLKIT_BUILD_EXAMPLES=ON
 cmake --build build --target micro_toolkit_iot_sensor_node
 ```
 
+When using Visual Studio multi-config generators, run CTest with an explicit
+configuration:
+
+```bash
+ctest --test-dir out/build -C Debug --output-on-failure
+```
+
+This is normal multi-config generator behavior, not a project-specific failure.
+
 Optional feature toggles exercised by CI configuration:
 
 ```bash
