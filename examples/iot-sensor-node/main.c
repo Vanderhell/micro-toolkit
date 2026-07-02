@@ -12,12 +12,15 @@
 #include "freertos/task.h"
 #include "esp_timer.h"
 #else
+#if defined(_WIN32)
+#include <windows.h>
+#else
 #define _POSIX_C_SOURCE 200809L
 #include <time.h>
 #include <unistd.h>
 #endif
+#endif
 
-#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -126,6 +129,8 @@ static uint32_t plat_now_ms(void)
 {
 #ifdef ESP_PLATFORM
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
+#elif defined(_WIN32)
+    return (uint32_t)GetTickCount64();
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -143,6 +148,8 @@ static void plat_sleep_ms(uint32_t delay_ms)
 {
 #ifdef ESP_PLATFORM
     vTaskDelay(pdMS_TO_TICKS(delay_ms));
+#elif defined(_WIN32)
+    Sleep(delay_ms);
 #else
     struct timespec ts;
     ts.tv_sec = (time_t)(delay_ms / 1000u);
