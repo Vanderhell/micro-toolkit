@@ -1,102 +1,94 @@
 # IoT Sensor Node Example
 
-A complete example using **all nine micro-toolkit libraries** together
-in a simulated temperature/humidity sensor node.
+This example is a Linux-first integration sample that exercises the current
+public headers of:
 
-## What it demonstrates
+- `microconf`
+- `microfsm`
+- `micoring`
+- `microres`
+- `microcbor`
+- `microlog`
+- `microsh`
+- `microtimer`
+- `microbus`
 
-| Library | Role in this example |
-|---------|---------------------|
-| microconf | Load MQTT host, port, device ID from flash (CRC validated) |
-| microfsm | Device lifecycle: BOOT → CONNECTING → ONLINE → PUBLISHING → ERROR |
-| micoring | ISR-safe ring buffer between DHT22 interrupt and main loop |
-| microres | Circuit breaker on MQTT publish + exponential backoff retry |
-| microcbor | Encode telemetry as compact CBOR (~50 bytes vs ~80 JSON) |
-| microlog | Structured logging with timestamps and ANSI color |
-| microsh | Debug shell: `status`, `conf list`, `cbor`, `breaker`, `bus`, `timers` |
-| microtimer | Software timers: sensor report (periodic) + watchdog + LED blink |
-| microbus | Pub/sub event bus: sensor→main, publish results, breaker events |
+It is not a hardware verification artifact. ESP32 notes in this folder are a
+porting recipe only until you build and test them yourself.
 
-## Build & run
+## Build Inputs
 
-Linux/macOS simulation — replace platform stubs in `main.c` with your HAL calls for real hardware.
+By default the root build expects sibling dependency checkouts under
+`lib/<name>` at the repository root.
+
+Example:
+
+```text
+micro-toolkit/
+  lib/
+    microfsm/
+    microres/
+    microconf/
+    microlog/
+    microsh/
+    microcbor/
+    micoring/
+    microtimer/
+    microbus/
+```
+
+## Build With CMake
+
+From the repository root:
 
 ```bash
-# Clone all libraries alongside this repo
-git clone https://github.com/Vanderhell/microfsm   lib/microfsm
-git clone https://github.com/Vanderhell/microres   lib/microres
-git clone https://github.com/Vanderhell/microconf  lib/microconf
-git clone https://github.com/Vanderhell/microlog   lib/microlog
-git clone https://github.com/Vanderhell/microsh    lib/microsh
-git clone https://github.com/Vanderhell/microcbor  lib/microcbor
-git clone https://github.com/Vanderhell/micoring   lib/micoring
-git clone https://github.com/Vanderhell/microtimer lib/microtimer
-git clone https://github.com/Vanderhell/microbus   lib/microbus
-
-cd examples/iot-sensor-node
-make run
+cmake -S . -B build -DMICRO_TOOLKIT_BUILD_EXAMPLES=ON
+cmake --build build --target micro_toolkit_iot_sensor_node
 ```
 
-## Expected output
-
-```
-14.436 [I] BOOT: === IoT Sensor Node -- all 9 micro-toolkit libraries ===
-14.436 [W] CONF: Load failed (-6) — using defaults
-14.436 [I] CONF: esp32-node-01 @ broker.local:1883  interval=5000 ms
-14.436 [D] RING: Ring buffer ready — capacity=8, elem=16 B
-14.436 [I] FSM:  → BOOT
-14.436 [D] BUS:  Event bus ready — 2 subscribers
-14.436 [D] TMR:  3 timers created + started (report / watchdog / led)
-14.436 [I] SHELL: Debug shell ready — 9 commands registered
-14.436 [I] BOOT: All 9 subsystems initialised ✓
-14.436 [I] FSM:  → CONNECTING
-14.537 [I] FSM:  → ONLINE
-14.738 [D] SENSOR: seq=0  T=22.6°C  H=64.0%
-14.738 [D] CBOR: Encoded 50 B (vs ~80 JSON)
-14.738 [I] MQTT: [1] OK  50 B → sensors/esp32-node-01/telemetry
-14.939 [D] LED:  LED ▮ ON
-...
-
-sensor> status
-State     : ONLINE
-Published : 8 OK / 1 FAIL
-CBOR total: 450 B
-Breaker   : CLOSED
-Ring      : 0 pending
-WDG ticks : 0
-LED blinks: 3
-
-sensor> timers
-Timers:
-  [0] report       RUNNING  fires=9
-  [1] watchdog     RUNNING  fires=0
-  [2] led_blink    RUNNING  fires=3
-Total fires: 12
-
-sensor> bus
-Publishes : 21
-Deliveries: 3
-Dropped   : 0
-Subscribers: 2
-Queue     : 0 pending
-```
-
-## Porting to ESP32
-
-The same `main.c` compiles for both Linux and ESP32. The `#ifdef ESP_PLATFORM`
-blocks select the correct HAL automatically:
-
-| Stub | Replace with |
-|------|-------------|
-| `timer_report_cb` | GPIO ISR or `esp_timer` callback reading DHT22 |
-| `flash_read/write` | `nvs_get_blob` / `nvs_set_blob` |
-| `mqtt_publish_op` | `esp_mqtt_client_publish()` |
-| `plat_now_ms` | Already uses `esp_timer_get_time()` on ESP32 |
-| `plat_sleep_ms` | Already uses `vTaskDelay()` on ESP32 |
+Run on Linux:
 
 ```bash
-# ESP32 build
-idf.py set-target esp32
-idf.py build
-idf.py -p /dev/ttyUSB0 flash monitor
+./build/examples/iot-sensor-node/micro_toolkit_iot_sensor_node
 ```
+
+You can override dependency paths individually:
+
+```bash
+cmake -S . -B build \
+  -DMICRO_TOOLKIT_MICROFSM_DIR=/path/to/microfsm \
+  -DMICRO_TOOLKIT_MICRORES_DIR=/path/to/microres
+```
+
+## What The Example Covers
+
+- `microconf`: caller-owned `mconf_t`, validated schema, explicit default sizes,
+  context-aware I/O callbacks, and two-slot storage metadata.
+- `microfsm`: `mfsm_validate`, checked `mfsm_init`, and status-returning query
+  APIs.
+- `micoring`: sized `mring_init` and status-returning query helpers.
+- `microres`: `mres_platform_t`, retry seed/state, separate library status from
+  operation result, and no direct internal-field access.
+- `microcbor`: checked encoder operations plus `mcbor_validate_one` before
+  publish.
+- `microlog`: backend registration on the global logger without copying
+  instance storage into `mlog_global()`.
+- `microsh`: checked registration and execution results, built-in help slot not
+  double-registered.
+- `microtimer`: ABI-safe `mtimer_init` wrapper and status-returning query APIs.
+- `microbus`: checked init/subscribe/publish/queue/dispatch return values and
+  topic-zero avoidance.
+
+## Porting Notes
+
+- The checked-in source uses a Linux simulation loop.
+- `ESP_PLATFORM` branches are intentionally minimal and should be treated as a
+  starting point, not as proof of support.
+- The default checked-in `micoring` config is single-context, so ISR-to-main
+  concurrency claims must remain scoped until you switch to an atomic
+  configuration in the dependency itself.
+
+## Manual Verification
+
+See [../../docs/VERIFICATION.md](../../docs/VERIFICATION.md) for the exact
+commands and the current not-verified list.
