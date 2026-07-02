@@ -1,0 +1,91 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - master
+      - main
+  pull_request:
+
+jobs:
+  docs-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      CC: ${{ matrix.compiler }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify required docs exist
+        run: |
+          test -f README.md
+          test -f docs/INTEGRATION_MATRIX.md
+          test -f docs/API_MIGRATION.md
+          test -f docs/COOKBOOK.md
+          test -f docs/TROUBLESHOOTING.md
+          test -f docs/VERIFICATION.md
+          test -f CONTRIBUTING.md
+          test -f CHANGELOG.md
+
+      - name: Fetch dependency source trees
+        run: |
+          mkdir -p lib
+          git clone --depth 1 https://github.com/Vanderhell/microfsm.git lib/microfsm
+          git clone --depth 1 https://github.com/Vanderhell/microres.git lib/microres
+          git clone --depth 1 https://github.com/Vanderhell/microconf.git lib/microconf
+          git clone --depth 1 https://github.com/Vanderhell/microlog.git lib/microlog
+          git clone --depth 1 https://github.com/Vanderhell/microsh.git lib/microsh
+          git clone --depth 1 https://github.com/Vanderhell/microcbor.git lib/microcbor
+          git clone --depth 1 https://github.com/Vanderhell/micoring.git lib/micoring
+          git clone --depth 1 https://github.com/Vanderhell/microtimer.git lib/microtimer
+          git clone --depth 1 https://github.com/Vanderhell/microbus.git lib/microbus
+
+      - name: Configure integration build
+        run: cmake -S . -B build -DMICRO_TOOLKIT_BUILD_EXAMPLES=ON
+
+      - name: Build integration example
+        run: cmake --build build --target micro_toolkit_iot_sensor_node
+
+  feature-flags:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        config:
+          - name: microlog-off
+            args: -DMICRO_TOOLKIT_EXAMPLE_MLOG_COLOR=OFF -DMICRO_TOOLKIT_EXAMPLE_MLOG_TIMESTAMP=OFF
+          - name: microsh-off
+            args: -DMICRO_TOOLKIT_EXAMPLE_MSH_HISTORY=OFF -DMICRO_TOOLKIT_EXAMPLE_MSH_COMPLETE=OFF
+          - name: microcbor-off
+            args: -DMICRO_TOOLKIT_EXAMPLE_MCBOR_FLOAT32=OFF
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch dependency source trees
+        run: |
+          mkdir -p lib
+          git clone --depth 1 https://github.com/Vanderhell/microfsm.git lib/microfsm
+          git clone --depth 1 https://github.com/Vanderhell/microres.git lib/microres
+          git clone --depth 1 https://github.com/Vanderhell/microconf.git lib/microconf
+          git clone --depth 1 https://github.com/Vanderhell/microlog.git lib/microlog
+          git clone --depth 1 https://github.com/Vanderhell/microsh.git lib/microsh
+          git clone --depth 1 https://github.com/Vanderhell/microcbor.git lib/microcbor
+          git clone --depth 1 https://github.com/Vanderhell/micoring.git lib/micoring
+          git clone --depth 1 https://github.com/Vanderhell/microtimer.git lib/microtimer
+          git clone --depth 1 https://github.com/Vanderhell/microbus.git lib/microbus
+
+      - name: Configure feature build
+        run: cmake -S . -B build -DMICRO_TOOLKIT_BUILD_EXAMPLES=ON ${{ matrix.config.args }}
+
+      - name: Build feature variant
+        run: cmake --build build --target micro_toolkit_iot_sensor_node
+
+  not-verified:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Record intentionally unverified surfaces
+        run: |
+          echo "ESP32, STM32, Zephyr, Arduino, macOS, and MSVC remain not verified by this workflow."
