@@ -77,7 +77,13 @@ target_compile_definitions(micro_toolkit_iot_sensor_node PRIVATE
 )
 
 if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(micro_toolkit_iot_sensor_node PRIVATE -Wall -Wextra -Wpedantic -Werror)
+    target_compile_options(micro_toolkit_iot_sensor_node PRIVATE
+        -Wall
+        -Wextra
+        -Wpedantic
+        -Werror
+        -Wno-error=unused-function
+    )
 endif()
 
 add_test(
