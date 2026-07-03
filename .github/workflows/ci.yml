@@ -80,12 +80,3 @@ jobs:
 
       - name: Build feature variant
         run: cmake --build build --target micro_toolkit_iot_sensor_node
-
-  not-verified:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Record intentionally unverified surfaces
-        run: |
-          echo "ESP32, STM32, Zephyr, Arduino, macOS, and MSVC remain not verified by this workflow."
